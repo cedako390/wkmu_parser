@@ -7,6 +7,9 @@ check_links.py – проверяет все ссылки в all_data.json на 
 Опциональные аргументы окружения:
     WORKERS   – количество параллельных потоков (по умолчанию 10)
     TIMEOUT   – таймаут одного запроса в секундах (по умолчанию 10)
+
+После проверки создаётся файл-отчёт broken_links_report.log с записями вида:
+    Строка 42, ссылка https://example.com — HTTP 404
 """
 
 from __future__ import annotations
@@ -16,15 +19,17 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import requests
 
 # ---------------------------------------------------------------------------
 # Настройки
 # ---------------------------------------------------------------------------
-JSON_FILE = sys.argv[1] if len(sys.argv) > 1 else "all_data.json"
-WORKERS   = int(os.environ.get("WORKERS", 10))
-TIMEOUT   = int(os.environ.get("TIMEOUT", 10))
+JSON_FILE   = sys.argv[1] if len(sys.argv) > 1 else "all_data.json"
+WORKERS     = int(os.environ.get("WORKERS", 10))
+TIMEOUT     = int(os.environ.get("TIMEOUT", 10))
+REPORT_FILE = os.environ.get("REPORT_FILE", "broken_links_report.log")
 
 HEADERS = {
     "User-Agent": (
@@ -61,6 +66,16 @@ def collect_urls(data: dict) -> list[str]:
 def collect_urls_regex(text: str) -> list[str]:
     """Запасной метод: ищет все http/https-ссылки в сыром тексте."""
     return re.findall(r'https?://[^\s\'"<>]+', text)
+
+
+def find_url_line_numbers(raw_text: str) -> dict[str, int]:
+    """Возвращает словарь {url: номер_строки} для первого вхождения каждой ссылки."""
+    url_lines: dict[str, int] = {}
+    for lineno, line in enumerate(raw_text.splitlines(), start=1):
+        for url in re.findall(r'https?://[^\s\'"<>]+', line):
+            if url not in url_lines:
+                url_lines[url] = lineno
+    return url_lines
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +136,6 @@ def main() -> None:
     structured_urls = set(urls)
     extra = regex_urls - structured_urls
     if extra:
-        print(f"[INFO] Найдено дополнительных ссылок через regex: {len(extra)}")
         urls.extend(sorted(extra))
 
     # Убираем дубликаты, сохраняя порядок
@@ -132,38 +146,42 @@ def main() -> None:
             seen.add(u)
             unique_urls.append(u)
 
+    # Карта URL -> номер строки в файле
+    url_line_map = find_url_line_numbers(raw_text)
+
     total = len(unique_urls)
     print(f"Всего уникальных ссылок: {total}")
-    print(f"Потоков: {WORKERS}, таймаут: {TIMEOUT}s")
-    print("-" * 60)
 
     broken: list[tuple[str, str]] = []
     ok_count = 0
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(check_url, url): url for url in unique_urls}
-        done = 0
         for future in as_completed(futures):
-            done += 1
             url, error = future.result()
-            progress = f"[{done}/{total}]"
             if error:
-                print(f"{progress} ❌  {error}")
-                print(f"         {url}")
                 broken.append((url, error))
             else:
                 ok_count += 1
-                # Раскомментировать для подробного вывода успешных ссылок:
-                # print(f"{progress} ✓  {url}")
 
-    # Итог
-    print("-" * 60)
+    # Итог в консоль
     print(f"Проверено: {total}  |  ОК: {ok_count}  |  Проблемных: {len(broken)}")
 
-    if broken:
-        print("\n=== Проблемные ссылки ===")
-        for url, error in broken:
-            print(f"  {error:35s}  {url}")
+    # Отчёт в файл
+    with open(REPORT_FILE, "w", encoding="utf-8") as report:
+        report.write(f"Отчёт проверки ссылок: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        report.write(f"Файл: {JSON_FILE}\n")
+        report.write(f"Проверено: {total}  |  ОК: {ok_count}  |  Проблемных: {len(broken)}\n")
+        report.write("-" * 60 + "\n")
+        if broken:
+            for url, error in broken:
+                lineno = url_line_map.get(url)
+                line_label = f"Строка {lineno}" if lineno is not None else "Строка неизвестна"
+                report.write(f"{line_label}, ссылка {url} — {error}\n")
+        else:
+            report.write("Все ссылки доступны.\n")
+
+    print(f"Отчёт сохранён: {REPORT_FILE}")
 
 
 if __name__ == "__main__":
